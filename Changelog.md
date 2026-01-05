@@ -1,3 +1,15 @@
+### 0.15.1 (2026-01-06)
+
+Fixed issues:
+
+* fix(runtime): overflow issue of getting memory over 32-bit offset
+
+Thank all the contributors who made this release possible!
+
+Yi-Ying He
+
+If you want to build from source, please use WasmEdge-0.15.1-src.tar.gz instead of the zip or tarball provided by GitHub directly.
+
 ### 0.15.0 (2025-08-04)
 
 Features:
