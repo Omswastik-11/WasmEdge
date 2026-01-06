@@ -42,10 +42,61 @@ jobs:
   lint:
     uses: ./.github/workflows/reusable-call-linter.yml
 
-  build_riscv64:
-    name: RISC-V64
+  build_llvm_riscv:
+    name: Build and cache LLVM (riscv target)
     runs-on: ubuntu-latest
     needs: lint
+    steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+      with:
+        egress-policy: audit
+
+    - name: Checkout llvm-project (shallow)
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      with:
+        repository: llvm/llvm-project
+        ref: llvmorg-15.0.7
+        fetch-depth: 1
+
+    - name: Restore cached LLVM build
+      id: cache-llvm
+      uses: actions/cache@v4
+      with:
+        path: /opt/llvm-riscv-cache
+        key: llvm-riscv-15-ubuntu-2204
+
+    - name: Install build deps
+      if: steps.cache-llvm.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update -q -y
+        sudo apt-get install -q -y ninja-build python3 cmake g++ pkg-config
+
+    - name: Build LLVM for riscv (cached)
+      if: steps.cache-llvm.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p /opt/llvm-riscv-cache
+        mkdir -p /opt/llvm-riscv-src && mv * /opt/llvm-riscv-src/
+        cd /opt/llvm-riscv-src
+        mkdir -p build && cd build
+        cmake -G Ninja \
+          -DLLVM_ENABLE_PROJECTS="clang;lld" \
+          -DLLVM_TARGETS_TO_BUILD="RISCV;X86" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/opt/llvm-riscv \
+          ../llvm
+        ninja -j $(nproc)
+        ninja install
+        tar -C /opt -czf /opt/llvm-riscv-cache/llvm-riscv.tar.gz llvm-riscv
+
+    - name: List cache contents
+      run: |
+        ls -lh /opt/llvm-riscv-cache
+
+  build_riscv64:
+    name: Cross-build WasmEdge (riscv64)
+    runs-on: ubuntu-latest
+    needs: [lint, build_llvm_riscv]
     steps:
     - name: Harden the runner (Audit all outbound calls)
       uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
@@ -58,34 +109,62 @@ jobs:
     - name: Ensure git safe directory
       run: |
         git config --global --add safe.directory $(pwd)
-    - uses: uraimo/run-on-arch-action@aa8e672a03e10b403401927ea2ceda57e1b68ac3 # v3
-      name: Build and Test WasmEdge
+    - name: Restore cached LLVM
+      id: cache-llvm-use
+      uses: actions/cache@v4
       with:
-        arch: riscv64
-        distro: ubuntu22.04
-        githubToken: ${{ github.token }}
-        dockerRunArgs: |
-          --volume "${PWD}:/workplace"
-        shell: /bin/sh
-        install: |
-          apt-get update -q -y
-          apt-get install -q -y git cmake g++ dpkg
-          apt-get install -q -y software-properties-common
-          apt-get install -q -y llvm-15-dev liblld-15-dev zlib1g-dev
-          apt-get install -q -y wabt # For generating wasm
-        run: |
-          cd /workplace
-          mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j $(nproc) && make install
-          wasmedge -v
-          wasmedgec -v
-          wasmedge compile -h
-          wasmedge run -h
-          cd ../examples/wasm
-          wat2wasm fibonacci.wat -o fibonacci.wasm
-          wasmedgec fibonacci.wasm fibonacci_aot_c.wasm
-          wasmedge --reactor fibonacci_aot_c.wasm fib 30
-          wasmedge run --reactor fibonacci_aot_c.wasm fib 30
-          wasmedge compile fibonacci.wasm fibonacci_aot_compile.wasm
-          wasmedge --reactor fibonacci_aot_compile.wasm fib 30
-          wasmedge run --reactor fibonacci_aot_compile.wasm fib 30
+        path: /opt/llvm-riscv-cache
+        key: llvm-riscv-15-ubuntu-2204
+
+    - name: Extract cached LLVM
+      run: |
+        sudo tar -C /opt -xzf /opt/llvm-riscv-cache/llvm-riscv.tar.gz
+        ls -lh /opt/llvm-riscv/bin
+        /opt/llvm-riscv/bin/llvm-config --version
+
+    - name: Install cross toolchain and deps
+      run: |
+        sudo apt-get update -q -y
+        sudo apt-get install -q -y build-essential cmake git wget ca-certificates \
+          gcc-riscv64-linux-gnu g++-riscv64-linux-gnu libc6-dev-riscv64-cross \
+          zlib1g-dev wabt python3 pkg-config
+
+    - name: Create RISC-V toolchain file
+      run: |
+        cat > riscv-toolchain.cmake << 'EOF'
+        # RISC-V Cross-compilation Toolchain for WasmEdge
+        set(CMAKE_SYSTEM_NAME Linux)
+        set(CMAKE_SYSTEM_PROCESSOR riscv64)
+        set(CMAKE_C_COMPILER riscv64-linux-gnu-gcc)
+        set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
+        set(CMAKE_ASM_COMPILER riscv64-linux-gnu-gcc)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gc -mabi=lp64d")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc -mabi=lp64d")
+        set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+        set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
+        set(CMAKE_FIND_ROOT_PATH /usr/riscv64-linux-gnu /usr)
+        set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+        set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+        set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+        EOF
+
+    - name: Build WasmEdge (cross)
+      run: |
+        mkdir -p build && cd build
+        cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=../riscv-toolchain.cmake \
+          -DLLVM_DIR=/opt/llvm-riscv/lib/cmake/llvm \
+          -DLLVM_CONFIG_EXECUTABLE=/opt/llvm-riscv/bin/llvm-config \
+          ..
+        make -j$(nproc)
+        make DESTDIR=$(pwd)/install install
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: wasmedge-riscv64
+        path: |
+          build/install/
+          build/tools/
+        retention-days: 1
